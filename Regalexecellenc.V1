@@ -1,0 +1,163 @@
+//+------------------------------------------------------------------+
+//|         REGALEXCELLENCE.V1 Altra (MT5)             |
+//+------------------------------------------------------------------+
+#property copyright "Lucky-maker411"
+#property version   "2.00"
+#property strict
+
+//--- Inputs
+input string   InpSymbol         = "GER40";      // Symbol
+input double   InpLots           = 0.1;          // Lot size
+input int      InpFastMA         = 10;           // Fast MA period
+input int      InpSlowMA         = 21;           // Slow MA period
+input int      InpMAPriceType    = PRICE_CLOSE;  // MA price type
+input int      InpRSIPeriod      = 14;           // RSI period
+input double   InpRSIOverbought  = 70;           // RSI overbought
+input double   InpRSIOversold    = 30;           // RSI oversold
+input int      InpBBPeriod       = 20;           // BB period
+input double   InpBBDeviation    = 2.0;          // BB deviation
+input int      InpBreakoutLookback = 30;         // Breakout lookback bars
+input int      InpSL             = 200;          // Stop Loss (points)
+input int      InpTP             = 400;          // Take Profit (points)
+input int      InpTrailing       = 100;          // Trailing stop (points)
+input bool     InpTimeFilter     = true;         // Use Fixed Trading Hours
+input int      InpStartHour      = 8;            // Trading Start Hour (broker time)
+input int      InpEndHour        = 21;           // Trading End Hour (broker time)
+
+//--- Global Variables
+int fastMAHandle, slowMAHandle, bbHandle, rsiHandle;
+double fastMA[], slowMA[], bbUpper[], bbLower[], rsi[];
+datetime lastTradeTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   fastMAHandle = iMA(InpSymbol, PERIOD_M15, InpFastMA, 0, MODE_SMA, InpMAPriceType);
+   slowMAHandle = iMA(InpSymbol, PERIOD_M15, InpSlowMA, 0, MODE_SMA, InpMAPriceType);
+   bbHandle     = iBands(InpSymbol, PERIOD_M15, InpBBPeriod, 0, InpBBDeviation, InpMAPriceType);
+   rsiHandle    = iRSI(InpSymbol, PERIOD_M15, InpRSIPeriod, InpMAPriceType);
+   if(fastMAHandle<0 || slowMAHandle<0 || bbHandle<0 || rsiHandle<0)
+      return INIT_FAILED;
+   ArraySetAsSeries(fastMA, true);
+   ArraySetAsSeries(slowMA, true);
+   ArraySetAsSeries(bbUpper, true);
+   ArraySetAsSeries(bbLower, true);
+   ArraySetAsSeries(rsi, true);
+   return INIT_SUCCEEDED;
+  }
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   IndicatorRelease(fastMAHandle);
+   IndicatorRelease(slowMAHandle);
+   IndicatorRelease(bbHandle);
+   IndicatorRelease(rsiHandle);
+  }
+//+------------------------------------------------------------------+
+//| Custom Functions                                                 |
+//+------------------------------------------------------------------+
+// Check if within trading hours
+bool IsTradingHour()
+  {
+   if(!InpTimeFilter)
+      return true;
+   int hour = TimeHour(TimeCurrent());
+   return (hour >= InpStartHour && hour < InpEndHour);
+  }
+
+// Check for breakout
+bool IsBreakout(bool up)
+  {
+   double high=High[1], low=Low[1];
+   for(int i=2; i<=InpBreakoutLookback; i++)
+     {
+      if(up && High[i]>high) high=High[i];
+      if(!up && Low[i]<low) low=Low[i];
+     }
+   if(up)
+      return Close[1]>high;
+   else
+      return Close[1]<low;
+  }
+
+// Trailing stop
+void ManageTrailingStops()
+  {
+   for(int i=0;i<PositionsTotal();i++)
+     {
+      ulong ticket=PositionGetTicket(i);
+      if(PositionGetString(POSITION_SYMBOL)==InpSymbol)
+        {
+         double price=SymbolInfoDouble(InpSymbol,SYMBOL_BID);
+         double open=PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl=PositionGetDouble(POSITION_SL);
+         if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+           {
+            double newSL=price-InpTrailing*SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
+            if(newSL>sl && price-open>InpTrailing*SymbolInfoDouble(InpSymbol,SYMBOL_POINT))
+               trade.PositionModify(ticket,newSL,PositionGetDouble(POSITION_TP));
+           }
+         else if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL)
+           {
+            double newSL=price+InpTrailing*SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
+            if(newSL<sl && open-price>InpTrailing*SymbolInfoDouble(InpSymbol,SYMBOL_POINT))
+               trade.PositionModify(ticket,newSL,PositionGetDouble(POSITION_TP));
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+void OnTick()
+  {
+   //--- Update indicators
+   if(CopyBuffer(fastMAHandle,0,0,3,fastMA)<=0 ||
+      CopyBuffer(slowMAHandle,0,0,3,slowMA)<=0 ||
+      CopyBuffer(bbHandle,1,0,3,bbUpper)<=0 ||
+      CopyBuffer(bbHandle,2,0,3,bbLower)<=0 ||
+      CopyBuffer(rsiHandle,0,0,3,rsi)<=0)
+      return;
+   //--- Check time filter
+   if(!IsTradingHour())
+      return;
+   //--- Check if position exists
+   bool hasBuy=false, hasSell=false;
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      if(PositionGetString(POSITION_SYMBOL)==InpSymbol)
+        {
+         if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) hasBuy=true;
+         if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_SELL) hasSell=true;
+        }
+     }
+   //--- Signal logic
+   bool buySignal=false, sellSignal=false;
+   // MA cross + BB + RSI + Breakout
+   if(fastMA[1]<slowMA[1] && fastMA[0]>slowMA[0] && Close[0]>bbUpper[0] && rsi[0]<InpRSIOverbought && IsBreakout(true))
+      buySignal=true;
+   if(fastMA[1]>slowMA[1] && fastMA[0]<slowMA[0] && Close[0]<bbLower[0] && rsi[0]>InpRSIOversold && IsBreakout(false))
+      sellSignal=true;
+   //--- Execute trades
+   if(buySignal && !hasBuy && TimeCurrent()-lastTradeTime>60)
+     {
+      trade.Buy(InpLots,InpSymbol,0,Ask-InpSL*SymbolInfoDouble(InpSymbol,SYMBOL_POINT),Ask+InpTP*SymbolInfoDouble(InpSymbol,SYMBOL_POINT));
+      lastTradeTime=TimeCurrent();
+     }
+   if(sellSignal && !hasSell && TimeCurrent()-lastTradeTime>60)
+     {
+      trade.Sell(InpLots,InpSymbol,0,Bid+InpSL*SymbolInfoDouble(InpSymbol,SYMBOL_POINT),Bid-InpTP*SymbolInfoDouble(InpSymbol,SYMBOL_POINT));
+      lastTradeTime=TimeCurrent();
+     }
+   //--- Manage trailing stops
+   ManageTrailingStops();
+  }
+//+------------------------------------------------------------------+
